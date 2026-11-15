@@ -26,3 +26,9 @@ BATCH_RUNNING = 'BATCH_RUNNING'
 SUSPENDED = 'SUSPENDED'  # Only kept for backward compatibility with old clients
 UNKNOWN = 'UNKNOWN'
 DISABLED = 'DISABLED'
+# A cancellation was accepted by the scheduler, but the worker owning the
+# execution has not (yet) confirmed that it actually stopped.
+CANCEL_REQUESTED = 'CANCEL_REQUESTED'
+# The execution was stopped (or the task was never dispatched): the
+# cancellation is complete and the task stays cancelled until re-enabled.
+CANCELLED = 'CANCELLED'

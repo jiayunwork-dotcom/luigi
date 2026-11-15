@@ -34,6 +34,7 @@ import datetime
 import getpass
 import importlib
 import logging
+import math
 import multiprocessing
 import os
 import signal
@@ -57,7 +58,7 @@ from luigi.scheduler import WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED
 from luigi.target import Target
 from luigi.task import Task, Config, DynamicRequirements, flatten
 from luigi.task_register import TaskClassException
-from luigi.task_status import RUNNING
+from luigi.task_status import RUNNING, CANCELLED
 from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
 
 import json
@@ -118,7 +119,7 @@ class TaskProcess(multiprocessing.Process):
 
     def __init__(self, task, worker_id, result_queue, status_reporter,
                  use_multiprocessing=False, worker_timeout=0, check_unfulfilled_deps=True,
-                 check_complete_on_run=False, task_completion_cache=None):
+                 check_complete_on_run=False, task_completion_cache=None, execution_token=None):
         super(TaskProcess, self).__init__()
         self.task = task
         self.worker_id = worker_id
@@ -130,6 +131,10 @@ class TaskProcess(multiprocessing.Process):
         self.check_unfulfilled_deps = check_unfulfilled_deps
         self.check_complete_on_run = check_complete_on_run
         self.task_completion_cache = task_completion_cache
+        # identifies the execution (dispatch) this process belongs to; results
+        # are tagged with it so stale results of a previous execution of the
+        # same task id can be discarded
+        self.execution_token = execution_token
 
         # completeness check using the cache
         self.check_complete = functools.partial(check_complete_cached, completion_cache=task_completion_cache)
@@ -241,7 +246,7 @@ class TaskProcess(multiprocessing.Process):
 
         finally:
             self.result_queue.put(
-                (self.task.task_id, status, expl, missing, new_deps))
+                (self.task.task_id, status, expl, missing, new_deps, self.execution_token))
 
     def _handle_run_exception(self, ex):
         logger.exception("[pid %s] Worker %s failed    %s", os.getpid(), self.worker_id, self.task)
@@ -505,6 +510,10 @@ class worker(Config):
                                           'of tasks assigned to a worker. This can especially speed up tasks with '
                                           'dynamic dependencies but assumes that the completion status does not change '
                                           'after it was true the first time.')
+    cancel_timeout = FloatParameter(default=5.0,
+                                    description='Grace period in seconds a cancelled task process is given to '
+                                    'exit after being terminated, before it is killed forcibly. Must be a '
+                                    'finite positive number.')
 
 
 class KeepAliveThread(threading.Thread):
@@ -570,6 +579,8 @@ class Worker:
 
         assert self._config.wait_interval >= _WAIT_INTERVAL_EPS, "[worker] wait_interval must be positive"
         assert self._config.wait_jitter >= 0.0, "[worker] wait_jitter must be equal or greater than zero"
+        assert (math.isfinite(self._config.cancel_timeout) and self._config.cancel_timeout > 0), \
+            "[worker] cancel_timeout must be a finite positive number"
 
         self._id = worker_id
         self._scheduler = scheduler
@@ -602,6 +613,17 @@ class Worker:
         self._task_result_queue = multiprocessing.Queue()
         self._running_tasks = {}
         self._idle_since = None
+
+        # Execution (dispatch) tokens of the tasks we are currently running,
+        # as handed out by get_work. Used to tag results and to match cancel
+        # requests to the exact execution they refer to.
+        self._task_execution_tokens = {}
+
+        # Pending cancellation requests, task_id -> dict with keys
+        # 'token', 'term_sent', 'kill_sent', 'deadline'. Filled by the
+        # scheduler's cancel notifications (via ping/get_work) and advanced
+        # non-blockingly by the main worker loop in _process_cancels().
+        self._cancel_requests = {}
 
         # mp-safe dictionary for caching completation checks across task processes
         self._task_completion_cache = None
@@ -936,8 +958,18 @@ class Worker:
                 raise AsyncCompletionException(is_complete.trace)
             raise Exception("Return value of Task.complete() must be boolean (was %r)" % is_complete)
 
+    def _supports_cancellation(self):
+        """
+        Whether this worker runs every task in its own process, so that the
+        scheduler may ask it to cancel a single task execution.
+        """
+        return bool(self._config.force_multiprocessing
+                    or self.worker_processes > 1
+                    or self._config.timeout > 0)
+
     def _add_worker(self):
         self._worker_info.append(('first_task', self._first_task))
+        self._worker_info.append(('cancel_support', self._supports_cancellation()))
         self._scheduler.add_worker(self._id, self._worker_info)
 
     def _log_remote_tasks(self, get_work_response):
@@ -1006,6 +1038,11 @@ class Worker:
         running_tasks = r['running_tasks']
         task_id = self._get_work_task_id(r)
 
+        # cancellations travel with the normal get_work RPC as well as with
+        # pings; both channels are idempotent re-derivations of scheduler state
+        for cancel in r.get('cancel_tasks') or ():
+            self._note_cancel_request(cancel['task_id'], cancel.get('task_token'))
+
         self._get_work_response_history.append({
             'task_id': task_id,
             'running_tasks': running_tasks,
@@ -1030,6 +1067,9 @@ class Worker:
                 self._scheduled_tasks.get(batch_id) for batch_id in r['batch_task_ids']])
             self._batch_running_tasks[task_id] = batch_tasks
 
+        if task_id is not None:
+            self._task_execution_tokens[task_id] = r.get('task_token')
+
         return GetWorkResponse(
             task_id=task_id,
             running_tasks=running_tasks,
@@ -1046,6 +1086,14 @@ class Worker:
         if task_id in self._running_tasks:
             logger.debug('Got already running task id {} from scheduler, taking a break'.format(task_id))
             next(self._sleeper())
+            return
+
+        cancel = self._cancel_requests.get(task_id)
+        if cancel is not None and cancel['token'] == self._task_execution_tokens.get(task_id):
+            # the scheduler cancelled this dispatch before the task was started
+            logger.info('Not starting task %s: its execution was cancelled', task_id)
+            self._task_execution_tokens.pop(task_id, None)
+            self._report_task_cancelled(task_id, cancel['token'])
             return
 
         task = self._scheduled_tasks[task_id]
@@ -1073,7 +1121,103 @@ class Worker:
             check_unfulfilled_deps=self._config.check_unfulfilled_deps,
             check_complete_on_run=self._config.check_complete_on_run,
             task_completion_cache=self._task_completion_cache,
+            execution_token=self._task_execution_tokens.get(task.task_id),
         )
+
+    def _report_task_cancelled(self, task_id, task_token):
+        """
+        Tell the scheduler that the execution it cancelled has stopped.
+
+        The cancel request is only dropped once the report went through, so a
+        failed report is retried on a later pass of _process_cancels().
+        """
+        self.run_succeeded = False
+        self._add_task(worker=self._id,
+                       task_id=task_id,
+                       status=CANCELLED,
+                       runnable=None,
+                       task_token=task_token)
+        self._cancel_requests.pop(task_id, None)
+
+    def _reject_task_cancel(self, task_id, task_token):
+        """
+        Tell the scheduler that this execution cannot be cancelled after all
+        (it is not running in its own process). The scheduler then voids the
+        cancellation and leaves the execution running.
+        """
+        self._scheduler.reject_cancel_task(task_id=task_id, worker=self._id,
+                                           task_token=task_token)
+        self._cancel_requests.pop(task_id, None)
+
+    def _process_cancels(self):
+        """
+        Advance all pending cancellation requests without blocking.
+
+        Terminates (and, after ``cancel_timeout``, kills) the processes of
+        cancelled tasks, reaps them once they have exited, and only then
+        confirms the cancellation to the scheduler. Runs in the main worker
+        loop so neither heartbeats nor sibling tasks are blocked by waiting
+        for a process to exit.
+        """
+        if not self._cancel_requests:
+            return
+
+        now = time.time()
+        for task_id, cancel in list(self._cancel_requests.items()):
+            token = cancel['token']
+            task_process = self._running_tasks.get(task_id)
+
+            if task_process is None:
+                # The execution is not running here (already finished or never
+                # started): nothing left to stop, confirm right away.
+                self._report_task_cancelled(task_id, token)
+                continue
+
+            if self._task_execution_tokens.get(task_id) != token:
+                # Stale request aimed at a previous execution of this task id;
+                # the current execution must not be touched.
+                logger.debug('Discarding stale cancel request for %s', task_id)
+                self._cancel_requests.pop(task_id, None)
+                continue
+
+            if not task_process.use_multiprocessing:
+                # Safety net: the scheduler only sends cancel requests for
+                # tasks running in their own process, but a per-task
+                # worker_timeout=0 (or a worker_processes downgrade) can make
+                # this false. We must not kill the whole worker, so the
+                # cancellation is rejected and the execution keeps running.
+                logger.error('Cannot cancel %s: task is not running in a separate process', task_id)
+                self._reject_task_cancel(task_id, token)
+                continue
+
+            if not task_process.is_alive():
+                task_process.join()  # reap the child process
+                self._running_tasks.pop(task_id)
+                self._task_execution_tokens.pop(task_id, None)
+                self._report_task_cancelled(task_id, token)
+            elif not cancel['term_sent']:
+                logger.info('Terminating process of cancelled task %s (pid %s)',
+                            task_id, task_process.pid)
+                try:
+                    # non-blocking SIGTERM to the task process only; note we
+                    # deliberately bypass TaskProcess.terminate() which waits
+                    multiprocessing.Process.terminate(task_process)
+                except Exception:
+                    logger.exception('Failed to terminate process of task %s, will retry', task_id)
+                else:
+                    cancel['term_sent'] = True
+                    cancel['deadline'] = now + self._config.cancel_timeout
+            elif not cancel['kill_sent'] and now >= cancel['deadline']:
+                logger.warning('Cancelled task %s did not exit within cancel_timeout of %ss, '
+                               'killing process %s', task_id, self._config.cancel_timeout,
+                               task_process.pid)
+                try:
+                    task_process.kill()  # non-blocking SIGKILL
+                except Exception:
+                    logger.exception('Failed to kill process of task %s, will retry', task_id)
+                else:
+                    cancel['kill_sent'] = True
+            # once killed, the is_alive() check above reaps and confirms
 
     def _purge_children(self):
         """
@@ -1082,6 +1226,10 @@ class Worker:
         :return:
         """
         for task_id, p in self._running_tasks.items():
+            if task_id in self._cancel_requests:
+                # being cancelled: _process_cancels() owns this process and
+                # no failure may be reported for it
+                continue
             if not p.is_alive() and p.exitcode:
                 error_msg = 'Task {} died unexpectedly with exit code {}'.format(task_id, p.exitcode)
                 p.task.trigger_event(Event.PROCESS_FAILURE, p.task, error_msg)
@@ -1093,7 +1241,8 @@ class Worker:
                 continue
 
             logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
+            self._task_result_queue.put((task_id, FAILED, error_msg, [], [],
+                                         self._task_execution_tokens.get(task_id)))
 
     def _handle_next_task(self):
         """
@@ -1107,13 +1256,26 @@ class Worker:
         self._idle_since = None
         while True:
             self._purge_children()  # Deal with subprocess failures
+            self._process_cancels()  # Advance task cancellations
 
             try:
-                task_id, status, expl, missing, new_requirements = (
+                task_id, status, expl, missing, new_requirements, token = (
                     self._task_result_queue.get(
                         timeout=self._config.wait_interval))
             except Queue.Empty:
                 return
+
+            if task_id in self._cancel_requests:
+                # being cancelled: the cancellation logic owns this task and
+                # the result of the cancelled execution is irrelevant
+                logger.debug('Discarding result of cancelled task %s', task_id)
+                continue
+
+            if token != self._task_execution_tokens.get(task_id):
+                # result of a previous execution of this task id (e.g. put on
+                # the queue just before a cancelled execution was stopped)
+                logger.info('Discarding stale result for a previous execution of %s', task_id)
+                continue
 
             task = self._scheduled_tasks[task_id]
             if not task or task_id not in self._running_tasks:
@@ -1145,9 +1307,11 @@ class Worker:
                            module=task.task_module,
                            new_deps=new_deps,
                            assistant=self._assistant,
-                           retry_policy_dict=_get_retry_policy_dict(task))
+                           retry_policy_dict=_get_retry_policy_dict(task),
+                           task_token=self._task_execution_tokens.get(task_id))
 
             self._running_tasks.pop(task_id)
+            self._task_execution_tokens.pop(task_id, None)
 
             # re-add task to reschedule missing dependencies
             if missing:
@@ -1231,6 +1395,7 @@ class Worker:
         self._add_worker()
 
         while True:
+            self._process_cancels()  # Advance task cancellations
             while len(self._running_tasks) >= self.worker_processes > 0:
                 logger.debug('%d running tasks, waiting for next task to finish', len(self._running_tasks))
                 self._handle_next_task()
@@ -1243,7 +1408,7 @@ class Worker:
             if get_work_response.task_id is None:
                 if not self._stop_requesting_work:
                     self._log_remote_tasks(get_work_response)
-                if len(self._running_tasks) == 0:
+                if len(self._running_tasks) == 0 and not self._cancel_requests:
                     self._idle_since = self._idle_since or datetime.datetime.now()
                     if self._keep_alive(get_work_response):
                         next(sleeper)
@@ -1289,7 +1454,30 @@ class Worker:
         self.worker_processes = max(1, n)
 
         # tell the scheduler
-        self._scheduler.add_worker(self._id, {'workers': self.worker_processes})
+        self._scheduler.add_worker(self._id, {'workers': self.worker_processes,
+                                              'cancel_support': self._supports_cancellation()})
+
+    @rpc_message_callback
+    def cancel_task(self, task_id, task_token=None):
+        """
+        Handle a cancel notification from the scheduler.
+
+        Only records the request; the actual stopping is performed by the
+        main worker loop in _process_cancels() so that this heartbeat
+        callback never blocks.
+        """
+        self._note_cancel_request(task_id, task_token)
+
+    def _note_cancel_request(self, task_id, task_token=None):
+        task_id = str(task_id)
+        if task_id not in self._cancel_requests:
+            logger.info('Worker %s got cancel request for task %s', self._id, task_id)
+            self._cancel_requests[task_id] = {
+                'token': task_token,
+                'term_sent': False,
+                'kill_sent': False,
+                'deadline': None,
+            }
 
     @rpc_message_callback
     def dispatch_scheduler_message(self, task_id, message_id, content, **kwargs):

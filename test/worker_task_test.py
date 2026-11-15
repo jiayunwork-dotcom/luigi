@@ -68,7 +68,7 @@ class TaskProcessTest(LuigiTestCase):
 
         with mock.patch.object(result_queue, 'put') as mock_put:
             task_process.run()
-            mock_put.assert_called_once_with((task.task_id, DONE, "test success expl", [], None))
+            mock_put.assert_called_once_with((task.task_id, DONE, "test success expl", [], None, None))
 
     def test_update_result_queue_on_failure(self):
         # IMO this test makes no sense as it tests internal behavior and have
@@ -86,7 +86,7 @@ class TaskProcessTest(LuigiTestCase):
 
         with mock.patch.object(result_queue, 'put') as mock_put:
             task_process.run()
-            mock_put.assert_called_once_with((task.task_id, FAILED, "test failure expl", [], []))
+            mock_put.assert_called_once_with((task.task_id, FAILED, "test failure expl", [], [], None))
 
     def test_fail_on_false_complete(self):
         class NeverCompleteTask(luigi.Task):
@@ -104,6 +104,7 @@ class TaskProcessTest(LuigiTestCase):
                 FAILED,
                 StringContaining("finished running, but complete() is still returning false"),
                 [],
+                None,
                 None
             ))
 
@@ -141,6 +142,7 @@ class TaskProcessTest(LuigiTestCase):
                 StringContaining(f"Unfulfilled dependencies at run time: {', '.join(expected_missing)}"),
                 expected_missing,
                 [],
+                None,
             ))
 
     def test_cleanup_children_on_terminate(self):

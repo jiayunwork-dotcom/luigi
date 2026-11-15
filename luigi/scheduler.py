@@ -43,7 +43,7 @@ from luigi import notifications
 from luigi import parameter
 from luigi import task_history as history
 from luigi.task_status import DISABLED, DONE, FAILED, PENDING, RUNNING, SUSPENDED, UNKNOWN, \
-    BATCH_RUNNING
+    BATCH_RUNNING, CANCEL_REQUESTED, CANCELLED
 from luigi.task import Config
 from luigi.parameter import ParameterVisibility
 
@@ -272,6 +272,19 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Token identifying the current execution (dispatch) of this task. A
+        # new token is generated every time the task is dispatched by get_work,
+        # so that reports and cancel confirmations belonging to a previous
+        # execution of the same task id can be told apart and ignored.
+        self.running_token = None
+        # Cancellation bookkeeping, set when a cancel is accepted and this
+        # task enters CANCEL_REQUESTED. ``cancel_token`` is the token of the
+        # execution being cancelled and ``cancel_worker`` the id of the worker
+        # that owns (owned) it. Only that worker, reporting that exact token,
+        # may confirm the cancellation.
+        self.cancel_token = None
+        self.cancel_worker = None
+        self.cancel_requested_at = None
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -447,6 +460,10 @@ class SimpleTaskState:
                 pickle.dump(self.get_state(), fobj)
         except IOError:
             logger.warning("Failed saving scheduler state", exc_info=1)
+        except RuntimeError:
+            # the state was mutated concurrently while pickling (possible when
+            # the scheduler is used in-process); the next dump will persist it
+            logger.warning("Failed saving scheduler state due to concurrent modification", exc_info=1)
         else:
             logger.info("Saved state in %s", self._state_path)
 
@@ -524,6 +541,7 @@ class SimpleTaskState:
         task.worker_running = worker_id
         task.resources_running = task.resources
         task.time_running = time.time()
+        task.running_token = uuid.uuid4().hex
 
     def set_status(self, task, new_status, config=None):
         if new_status == FAILED:
@@ -593,9 +611,13 @@ class SimpleTaskState:
         if (not task.stakeholders) and (task.remove is None) and (task.status != RUNNING):
             # We don't check for the RUNNING case, because that is already handled
             # by the fail_dead_worker_task function.
-            logger.debug("Task %r has no stakeholders anymore -> might remove "
-                         "task in %s seconds", task.id, config.remove_delay)
-            task.remove = time.time() + config.remove_delay
+            # CANCEL_REQUESTED tasks are also kept: the cancellation must not
+            # be forgotten (and resources must not be released) just because
+            # the owning worker stopped heartbeating.
+            if task.status != CANCEL_REQUESTED:
+                logger.debug("Task %r has no stakeholders anymore -> might remove "
+                             "task in %s seconds", task.id, config.remove_delay)
+                task.remove = time.time() + config.remove_delay
 
         # Re-enable task after the disable time expires
         if task.status == DISABLED and task.scheduler_disable_time is not None:
@@ -796,7 +818,7 @@ class Scheduler:
                  deps=None, new_deps=None, expl=None, resources=None,
                  priority=0, family='', module=None, params=None, param_visibilities=None, accepts_messages=False,
                  assistant=False, tracking_url=None, worker=None, batchable=None,
-                 batch_id=None, retry_policy_dict=None, owners=None, **kwargs):
+                 batch_id=None, retry_policy_dict=None, owners=None, task_token=None, **kwargs):
         """
         * add task identified by task_id if it doesn't exist
         * if deps is not None, update dependency list
@@ -825,7 +847,38 @@ class Scheduler:
 
         task = self._state.get_task(task_id, setdefault=_default_task)
 
-        if task is None or (task.status != RUNNING and not worker.enabled):
+        if task is None:
+            return
+
+        if status == CANCELLED:
+            # A worker reporting that a cancelled execution has stopped.
+            # This is the only accepted source of CANCELLED statuses.
+            self._confirm_task_cancel(task, worker_id, task_token)
+            return
+
+        if task.status != RUNNING and not worker.enabled:
+            return
+
+        if task.status in (CANCEL_REQUESTED, CANCELLED):
+            # The task is being cancelled or is already cancelled. Status
+            # reports (DONE/FAILED/PENDING/progress/dynamic deps) from the
+            # cancelled execution must not resurrect or reschedule it, and
+            # must not trigger the normal failure/retry logic. A genuine
+            # (re)scheduling attempt (runnable=True) only refreshes the
+            # bookkeeping so the task can be dispatched again after an
+            # explicit re_enable_task().
+            if runnable:
+                self._update_task_bookkeeping(
+                    task, worker, worker_id, assistant, deps, None, resources,
+                    priority, runnable, status, retry_policy)
+            return
+
+        if (task_token is not None and status in (DONE, FAILED) and task.status == RUNNING
+                and getattr(task, 'running_token', None) is not None
+                and task_token != task.running_token):
+            # Result of a previous execution of this task id (e.g. a report
+            # that was in flight when a newer execution was dispatched).
+            logger.info("Ignoring stale %s report for previous execution of %s", status, task_id)
             return
 
         # Ignore claims that the task is PENDING if it very recently was marked as DONE.
@@ -915,6 +968,20 @@ class Scheduler:
         if resources is not None:
             task.resources = resources
 
+        self._update_task_stakeholders(task, worker, worker_id, assistant, priority)
+
+        self._update_priority(task, priority, worker_id)
+
+        # Because some tasks (non-dynamic dependencies) are `_make_task`ed
+        # before we know their retry_policy, we always set it here
+        task.retry_policy = retry_policy
+
+        if runnable and status != FAILED and worker.enabled:
+            task.workers.add(worker_id)
+            self._state.get_worker(worker_id).tasks.add(task)
+            task.runnable = runnable
+
+    def _update_task_stakeholders(self, task, worker, worker_id, assistant, priority):
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
 
@@ -924,10 +991,30 @@ class Scheduler:
                 t = self._state.get_task(dep, setdefault=self._make_task(task_id=dep, status=UNKNOWN, deps=None, priority=priority))
                 t.stakeholders.add(worker_id)
 
+    def _update_task_bookkeeping(self, task, worker, worker_id, assistant, deps,
+                                 new_deps, resources, priority, runnable, status,
+                                 retry_policy):
+        """
+        Update everything about a task that is not its status: dependencies,
+        resources, stakeholders, priority and runnability.
+
+        Used both for normal add_task reports and for reports arriving while
+        a task is being cancelled (where the status itself must be left
+        untouched).
+        """
+        if deps is not None:
+            task.deps = set(deps)
+
+        if new_deps is not None:
+            task.deps.update(new_deps)
+
+        if resources is not None:
+            task.resources = resources
+
+        self._update_task_stakeholders(task, worker, worker_id, assistant, priority)
+
         self._update_priority(task, priority, worker_id)
 
-        # Because some tasks (non-dynamic dependencies) are `_make_task`ed
-        # before we know their retry_policy, we always set it here
         task.retry_policy = retry_policy
 
         if runnable and status != FAILED and worker.enabled:
@@ -958,6 +1045,139 @@ class Scheduler:
     @rpc_method()
     def disable_worker(self, worker):
         self._state.disable_workers({worker})
+
+    @rpc_method()
+    def cancel_task(self, task_id=None, **kwargs):
+        """
+        Request cancellation of a single task without disturbing anything else
+        the owning worker is running.
+
+        Returns a dict with at least:
+
+        accepted
+            True if this call newly accepted a cancellation. False for unknown
+            tasks, tasks in a final state (DONE/FAILED), tasks that cannot be
+            cancelled (e.g. batch runs or tasks executing in the worker's main
+            process) and for repeated cancel requests (which have no
+            additional effect).
+        status
+            The task status after this call (None for unknown tasks).
+            CANCEL_REQUESTED means the cancellation was accepted but the
+            execution is not confirmed stopped yet; CANCELLED means the
+            execution has stopped (or was never dispatched).
+        """
+        task = self._state.get_task(task_id)
+        if task is None:
+            return {'task_id': task_id, 'accepted': False, 'status': None}
+
+        status = task.status
+
+        if status == PENDING:
+            # Never dispatched: there is no execution to stop, so the
+            # cancellation completes immediately.
+            task.cancel_requested_at = time.time()
+            task.remove = None  # keep the cancelled task around
+            self._state.set_status(task, CANCELLED, self._config)
+            self.dump()
+            return {'task_id': task_id, 'accepted': True, 'status': task.status}
+
+        if status != RUNNING:
+            # DONE/FAILED/DISABLED/UNKNOWN/BATCH_RUNNING tasks are not
+            # cancellable; CANCELLED/CANCEL_REQUESTED mean this is a repeated
+            # request, which must not have a second effect. In all cases the
+            # current status is simply reported back.
+            return {'task_id': task_id, 'accepted': False, 'status': status}
+
+        if task.batch_id is not None:
+            # Batch runs are executed as a group; cancelling a single member
+            # is not supported.
+            return {'task_id': task_id, 'accepted': False, 'status': status}
+
+        worker_id = task.worker_running
+        worker = self._state._active_workers.get(worker_id) if worker_id else None
+        if worker is None or not worker.info.get('cancel_support', False):
+            # The owning worker does not run tasks as separate processes (or
+            # is gone), so the execution cannot be stopped individually.
+            return {'task_id': task_id, 'accepted': False, 'status': status}
+
+        # Accept the cancellation. The decision is persisted right away and
+        # communicated to the owning worker through its normal ping/get_work
+        # channel (see _cancel_requests_for_worker) until it confirms.
+        task.cancel_token = getattr(task, 'running_token', None)
+        task.cancel_worker = worker_id
+        task.cancel_requested_at = time.time()
+        task.remove = None  # keep the task around while the cancel is unconfirmed
+        self._state.set_status(task, CANCEL_REQUESTED, self._config)
+        self.dump()
+        logger.info("Cancellation of task %s (running on worker %s) was requested",
+                    task_id, worker_id)
+        return {'task_id': task_id, 'accepted': True, 'status': task.status}
+
+    def _confirm_task_cancel(self, task, worker_id, task_token):
+        """
+        Handle a worker report that a cancelled execution has stopped.
+
+        Only the worker that owns the cancelled execution may confirm it, and
+        only with the token of that exact execution. Duplicate, late or
+        foreign confirmations are ignored.
+        """
+        if task.status != CANCEL_REQUESTED:
+            logger.debug("Ignoring cancel confirmation for %s in status %s",
+                         task.id, task.status)
+            return
+        if worker_id != getattr(task, 'cancel_worker', None):
+            logger.warning("Ignoring cancel confirmation for %s from worker %s "
+                           "which does not own the cancelled execution",
+                           task.id, worker_id)
+            return
+        if task_token != getattr(task, 'cancel_token', None):
+            logger.warning("Ignoring cancel confirmation for %s with non-matching "
+                           "execution token", task.id)
+            return
+
+        logger.info("Cancellation of task %s confirmed by worker %s", task.id, worker_id)
+        task.worker_running = None
+        task.time_running = None
+        task.cancel_token = None
+        task.cancel_worker = None
+        # resources are released by the status change: _used_resources() only
+        # counts RUNNING and CANCEL_REQUESTED tasks.
+        self._state.set_status(task, CANCELLED, self._config)
+        self.dump()
+
+    def _cancel_requests_for_worker(self, worker_id):
+        """
+        Cancel decisions waiting for confirmation by the given worker.
+
+        These are regenerated from the (persisted) task state on every
+        heartbeat, so the notification survives scheduler restarts and lost
+        messages instead of relying on a single volatile delivery.
+        """
+        return [
+            {'task_id': task.id, 'task_token': getattr(task, 'cancel_token', None)}
+            for task in self._state.get_active_tasks_by_status(CANCEL_REQUESTED)
+            if getattr(task, 'cancel_worker', None) == worker_id
+        ]
+
+    @rpc_method()
+    def reject_cancel_task(self, task_id=None, worker=None, task_token=None, **kwargs):
+        """
+        Called by the owning worker when it cannot stop the execution after
+        all (e.g. the task turned out to run in the worker's own process).
+        Voids the cancellation; the execution keeps running undisturbed.
+        """
+        task = self._state.get_task(task_id)
+        if task is None or task.status != CANCEL_REQUESTED:
+            return
+        if worker != getattr(task, 'cancel_worker', None):
+            return
+        if task_token != getattr(task, 'cancel_token', None):
+            return
+        logger.info("Worker %s cannot cancel task %s; cancellation voided", worker, task_id)
+        task.cancel_token = None
+        task.cancel_worker = None
+        task.cancel_requested_at = None
+        self._state.set_status(task, RUNNING, self._config)
 
     @rpc_method()
     def set_worker_processes(self, worker, n):
@@ -1041,7 +1261,10 @@ class Scheduler:
     def _used_resources(self):
         used_resources = collections.defaultdict(int)
         if self._resources is not None:
-            for task in self._state.get_active_tasks_by_status(RUNNING):
+            # CANCEL_REQUESTED tasks are still executing (or at least not
+            # confirmed stopped), so their resources stay reserved until the
+            # cancellation is confirmed.
+            for task in self._state.get_active_tasks_by_status(RUNNING, CANCEL_REQUESTED):
                 resources_running = getattr(task, "resources_running", task.resources)
                 if resources_running:
                     for resource, amount in resources_running.items():
@@ -1229,6 +1452,12 @@ class Scheduler:
 
         reply = self.count_pending(worker_id)
 
+        # pending cancellations for this worker, re-derived from state on
+        # every call (only included when there is something to cancel)
+        cancel_tasks = self._cancel_requests_for_worker(worker_id)
+        if cancel_tasks:
+            reply['cancel_tasks'] = cancel_tasks
+
         if len(batched_tasks) > 1:
             batch_string = '|'.join(task.id for task in batched_tasks)
             batch_id = hashlib.new('md5', batch_string.encode('utf-8'), usedforsecurity=False).hexdigest()
@@ -1242,6 +1471,7 @@ class Scheduler:
             reply['task_family'] = best_task.family
             reply['task_module'] = getattr(best_task, 'module', None)
             reply['task_params'] = combined_params
+            reply['task_token'] = best_task.running_token
             reply['batch_id'] = batch_id
             reply['batch_task_ids'] = [task.id for task in batched_tasks]
 
@@ -1251,12 +1481,14 @@ class Scheduler:
             best_task.worker_running = worker_id
             best_task.resources_running = best_task.resources.copy()
             best_task.time_running = time.time()
+            best_task.running_token = uuid.uuid4().hex
             self._update_task_history(best_task, RUNNING, host=host)
 
             reply['task_id'] = best_task.id
             reply['task_family'] = best_task.family
             reply['task_module'] = getattr(best_task, 'module', None)
             reply['task_params'] = best_task.params
+            reply['task_token'] = best_task.running_token
 
         else:
             reply['task_id'] = None
@@ -1267,7 +1499,15 @@ class Scheduler:
     def ping(self, **kwargs):
         worker_id = kwargs['worker']
         worker = self._update_worker(worker_id)
-        return {"rpc_messages": worker.fetch_rpc_messages()}
+        messages = worker.fetch_rpc_messages()
+        # Re-derive pending cancellations from persisted state on every
+        # heartbeat: delivery is at-least-once and survives scheduler
+        # restarts; the worker treats duplicates idempotently.
+        messages.extend(
+            {'name': 'cancel_task', 'kwargs': cancel}
+            for cancel in self._cancel_requests_for_worker(worker_id)
+        )
+        return {"rpc_messages": messages}
 
     def _upstream_status(self, task_id, upstream_status_table):
         if task_id in upstream_status_table:
@@ -1554,6 +1794,17 @@ class Scheduler:
         task = self._state.get_task(task_id)
         if task and task.status == DISABLED and task.scheduler_disable_time:
             self._state.re_enable(task, self._config)
+            serialized = self._serialize_task(task_id)
+        elif task and task.status == CANCELLED:
+            # Explicitly re-open a task whose cancellation completed, making
+            # it schedulable again. A task whose cancellation is still
+            # unconfirmed (CANCEL_REQUESTED) cannot be re-enabled.
+            task.scheduler_disable_time = None
+            task.clear_failures()
+            task.cancel_token = None
+            task.cancel_worker = None
+            task.cancel_requested_at = None
+            self._state.set_status(task, PENDING, self._config)
             serialized = self._serialize_task(task_id)
         return serialized
 
