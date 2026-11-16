@@ -75,6 +75,14 @@ STATUS_TO_UPSTREAM_MAP = {
 WORKER_STATE_DISABLED = 'disabled'
 WORKER_STATE_ACTIVE = 'active'
 
+# Every batch execution token minted by the scheduler starts with this
+# prefix. This makes a token self-identifying: the scheduler can tell a batch
+# report apart from an ordinary single-task report without keeping any
+# record of finished executions around. A batch token that no longer names a
+# live execution can only be a duplicate or a leftover of an older
+# execution, and is therefore ignored unconditionally.
+BATCH_EXECUTION_TOKEN_PREFIX = 'batch-'
+
 TASK_FAMILY_RE = re.compile(r'([^(_]+)[(_]')
 
 RPC_METHODS = {}
@@ -272,6 +280,18 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        # Identity of the batch execution (dispatch) this task currently takes
+        # part in. ``batch_id`` only groups the member task ids and is stable
+        # for a given member combination, so the very same member set being
+        # dispatched again (after a retry or a re-submission) gets the same
+        # batch_id. A fresh ``batch_execution`` token is generated for every
+        # dispatch instead; all members and the batch runner carry it, and
+        # every message about a batch must present it to have any effect.
+        # ``batch_runner`` is the id of the task registered to execute the
+        # batch, and is set on every task of the execution when the runner
+        # registers. All three are cleared as soon as the execution finishes.
+        self.batch_execution = None
+        self.batch_runner = None
         # Token identifying the current execution (dispatch) of this task. A
         # new token is generated every time the task is dispatched by get_work,
         # so that reports and cancel confirmations belonging to a previous
@@ -429,6 +449,41 @@ class Worker:
         return self.id
 
 
+class BatchExecution:
+    """
+    One dispatch of a batch of tasks.
+
+    A batch is identified towards the outside by ``batch_id``, which is
+    derived from the member task ids (and is therefore stable when the very
+    same combination is dispatched again after a retry or re-submission).
+    ``token`` identifies this *execution* of that batch; it is handed to the
+    worker in the ``get_work`` reply and must be presented back when the batch
+    runner registers and when its result is reported. Whatever is reported
+    with any other token is a leftover of an older execution and is ignored.
+
+    The record lives in the scheduler state (and therefore in dump/load) only
+    while the execution can still legitimately produce messages: from
+    ``get_work`` until it is finished, superseded or pruned. Finished records
+    are dropped, so a duplicate result finds no record and has no effect.
+    """
+
+    def __init__(self, token, batch_id, task_ids, worker_id, created):
+        self.token = token
+        self.batch_id = batch_id
+        self.task_ids = list(task_ids)
+        self.worker_id = worker_id
+        self.created = created
+        # Task id the worker uses to run the batch. It may be one of the
+        # member ids (e.g. when the batch_method combines to the value of a
+        # member) or a completely independent id (e.g. ','.join). It is
+        # recorded on every member so that members and runner agree on the
+        # execution they belong to.
+        self.runner_task_id = None
+
+    def __repr__(self):
+        return "BatchExecution(%r)" % vars(self)
+
+
 class SimpleTaskState:
     """
     Keep track of the current state and handle persistence.
@@ -444,15 +499,31 @@ class SimpleTaskState:
         self._status_tasks = collections.defaultdict(dict)
         self._active_workers = {}  # map from id to a Worker object
         self._task_batchers = {}
+        # Live batch executions by execution token. An entry is added when a
+        # batch is dispatched by get_work and removed when the execution
+        # finishes or is superseded, so this only ever holds batches that may
+        # still legitimately report progress and results. No record of
+        # finished executions is kept: batch tokens carry
+        # BATCH_EXECUTION_TOKEN_PREFIX, so a batch message naming an unknown
+        # token is known to be stale without any bookkeeping.
+        self._batch_executions = {}
         self._metrics_collector = None
 
     def get_state(self):
-        return self._tasks, self._active_workers, self._task_batchers
+        return (self._tasks, self._active_workers, self._task_batchers,
+                self._batch_executions)
 
     def set_state(self, state):
         self._tasks, self._active_workers = state[:2]
         if len(state) >= 3:
             self._task_batchers = state[2]
+        else:
+            self._task_batchers = {}
+        if len(state) >= 4:
+            self._batch_executions = state[3]
+        else:
+            # state written before batch executions were tracked
+            self._batch_executions = {}
 
     def dump(self):
         try:
@@ -481,6 +552,20 @@ class SimpleTaskState:
             self.set_state(state)
             self._status_tasks = collections.defaultdict(dict)
             for task in self._tasks.values():
+                # State files written by older versions don't know about the
+                # execution association fields added later. Default them so
+                # old state can be loaded and used normally.
+                for attr, default in (
+                        ('running_token', None),
+                        ('batch_execution', None),
+                        ('batch_runner', None),
+                        ('cancel_token', None),
+                        ('cancel_worker', None),
+                        ('cancel_requested_at', None),
+                        ('batchable', False),
+                ):
+                    if not hasattr(task, attr):
+                        setattr(task, attr, default)
                 self._status_tasks[task.status][task.id] = task
         else:
             logger.info("No prior state file exists at %s. Starting with empty state", self._state_path)
@@ -503,6 +588,42 @@ class SimpleTaskState:
             task for task in self.get_active_tasks_by_status(BATCH_RUNNING)
             if task.batch_id == batch_id
         ]
+
+    def get_batch_members(self, execution):
+        """
+        The still-active tasks that belong to the given batch execution.
+
+        Members are identified by the execution token they carry rather than
+        by ``batch_id`` alone: the same member combination can be dispatched
+        again (retry, re-submission) and both executions share their
+        ``batch_id``. Only tasks carrying this execution's token take part in
+        this execution's completion.
+        """
+        members = []
+        for task in self.get_active_tasks_by_status(BATCH_RUNNING, RUNNING):
+            if getattr(task, 'batch_execution', None) == execution.token:
+                members.append(task)
+        return members
+
+    def bind_batch_runner(self, execution, runner_task_id):
+        """Record the id of the task executing the batch execution."""
+        execution.runner_task_id = runner_task_id
+        for task in self.get_batch_members(execution):
+            task.batch_runner = runner_task_id
+
+    def batch_resources(self, execution):
+        """
+        The resources the batch execution has claimed.
+
+        Members of a batch share one slot: the batch runs once, using the
+        resources of the member that was picked first. All other members copy
+        this so that resources are accounted for once per execution.
+        """
+        for task_id in execution.task_ids:
+            task = self._tasks.get(task_id)
+            if task is not None and task.batch_execution == execution.token:
+                return dict(getattr(task, 'resources_running', None) or task.resources or {})
+        return {}
 
     def set_batcher(self, worker_id, family, batcher_args, max_batch_size):
         self._task_batchers.setdefault(worker_id, {})
@@ -535,22 +656,120 @@ class SimpleTaskState:
             self.set_status(task, FAILED, config)
             task.clear_failures()
 
-    def set_batch_running(self, task, batch_id, worker_id):
+    def set_batch_running(self, task, batch_id, worker_id, execution_token=None):
         self.set_status(task, BATCH_RUNNING)
         task.batch_id = batch_id
+        task.batch_execution = execution_token
+        task.batch_runner = None
         task.worker_running = worker_id
         task.resources_running = task.resources
         task.time_running = time.time()
-        task.running_token = uuid.uuid4().hex
+        # The execution token is the one fact shared by the members and by the
+        # batch runner (which may be a different task id, or the id of one of
+        # the members). It is what workers hand back when registering the
+        # runner and when reporting its result, so it doubles as the task's
+        # running token for the duration of the batch.
+        task.running_token = execution_token or uuid.uuid4().hex
 
-    def set_status(self, task, new_status, config=None):
+    def register_batch_execution(self, execution):
+        """Record a freshly dispatched batch execution."""
+        for token in list(self._batch_executions):
+            if self._batch_executions[token].batch_id == execution.batch_id:
+                # The same member combination is being dispatched again. Any
+                # older execution of it can no longer send messages that should
+                # have an effect.
+                del self._batch_executions[token]
+        self._batch_executions[execution.token] = execution
+
+    def redispatch_batch_execution(self, execution):
+        """
+        Re-dispatch a batch whose runner has to run again.
+
+        This happens when the worker asks for work after having lost track of
+        its running tasks (``current_tasks=()``), e.g. after a worker restart.
+        The members stay BATCH_RUNNING, but under a new execution token, so a
+        late result of the previous run can not finish this one.
+        """
+        new_execution = BatchExecution(
+            token=BATCH_EXECUTION_TOKEN_PREFIX + uuid.uuid4().hex,
+            batch_id=execution.batch_id,
+            task_ids=list(execution.task_ids),
+            worker_id=execution.worker_id,
+            created=time.time(),
+        )
+        old_token = execution.token
+        self._batch_executions.pop(old_token, None)
+        self._batch_executions[new_execution.token] = new_execution
+        for task_id in new_execution.task_ids:
+            task = self._tasks.get(task_id)
+            if task is None:
+                continue
+            if getattr(task, 'batch_execution', None) == old_token:
+                task.batch_execution = new_execution.token
+                task.running_token = new_execution.token
+                task.batch_runner = None
+        if execution.runner_task_id is not None:
+            self.bind_batch_runner(new_execution, execution.runner_task_id)
+            runner = self._tasks.get(execution.runner_task_id)
+            if runner is not None:
+                if getattr(runner, 'batch_execution', None) == old_token:
+                    runner.batch_execution = new_execution.token
+                runner.batch_id = new_execution.batch_id
+                runner.batch_runner = execution.runner_task_id
+                runner.running_token = new_execution.token
+        return new_execution
+
+    def gc_batch_executions(self):
+        """
+        Drop execution records that no active task refers to any more.
+
+        An execution is live exactly as long as at least one task is still
+        running (or batch-running) with its token. This keeps the persisted
+        association small even if a worker disappears without reporting a
+        result.
+        """
+        tokens = {
+            getattr(task, 'batch_execution', None)
+            for task in self._status_tasks[BATCH_RUNNING].values()
+        }
+        tokens.update(
+            getattr(task, 'batch_execution', None)
+            for task in self._status_tasks[RUNNING].values()
+        )
+        tokens.discard(None)
+        for token in list(self._batch_executions):
+            if token not in tokens:
+                del self._batch_executions[token]
+
+    def find_batch_execution_by_batch_id(self, batch_id):
+        if batch_id is not None:
+            for execution in self._batch_executions.values():
+                if execution.batch_id == batch_id:
+                    return execution
+        return None
+
+    def mark_batch_finished(self, task):
+        """Detach a task from its (finished) batch execution."""
+        task.batch_id = None
+        task.batch_execution = None
+        task.batch_runner = None
+        task.worker_running = None
+        task.time_running = None
+
+    def clear_batch_association(self, task):
+        task.batch_id = None
+        task.batch_execution = None
+        task.batch_runner = None
+
+    def set_status(self, task, new_status, config=None, remove_on_failure=None):
         if new_status == FAILED:
             assert config is not None
 
         if new_status == DISABLED and task.status in (RUNNING, BATCH_RUNNING):
             return
 
-        remove_on_failure = task.batch_id is not None and not task.batchable
+        if remove_on_failure is None:
+            remove_on_failure = task.batch_id is not None and not task.batchable
 
         if task.status == DISABLED:
             if new_status == DONE:
@@ -561,10 +780,16 @@ class SimpleTaskState:
                 return
 
         if task.status == RUNNING and task.batch_id is not None and new_status != RUNNING:
-            for batch_task in self.get_batch_running_tasks(task.batch_id):
-                self.set_status(batch_task, new_status, config)
-                batch_task.batch_id = None
-            task.batch_id = None
+            # Legacy batch association (only ``batch_id``, no execution
+            # token): a runner completing finishes the whole batch. Batches
+            # dispatched with an execution token are finished explicitly by
+            # Scheduler._finish_batch_execution(), where every member is
+            # accounted for individually.
+            if getattr(task, 'batch_execution', None) is None:
+                for batch_task in self.get_batch_running_tasks(task.batch_id):
+                    self.set_status(batch_task, new_status, config)
+                    self.clear_batch_association(batch_task)
+                task.batch_id = None
 
         if new_status == FAILED and task.status != DISABLED:
             task.add_failure()
@@ -602,8 +827,14 @@ class SimpleTaskState:
             logger.info("Task %r is marked as running by disconnected worker %r -> marking as "
                         "FAILED with retry delay of %rs", task.id, task.worker_running,
                         config.retry_delay)
+            token = getattr(task, 'batch_execution', None)
             task.worker_running = None
             self.set_status(task, FAILED, config)
+            if token is not None:
+                # The execution can not finish any more; detach this task so
+                # a later retry starts from a clean association. The other
+                # members are failed individually by the same loop.
+                self.mark_batch_finished(task)
             task.retry = time.time() + config.retry_delay
 
     def update_status(self, task, config):
@@ -757,6 +988,7 @@ class Scheduler:
                 remove_tasks.append(task.id)
 
         self._state.inactivate_tasks(remove_tasks)
+        self._state.gc_batch_executions()
 
     def _prune_emails(self):
         if self._config.batch_emails:
@@ -810,7 +1042,14 @@ class Scheduler:
         # we can force mark DONE for running or failed tasks
         if task.status in {RUNNING, FAILED, DISABLED}:
             self._update_task_history(task, status)
-            self._state.set_status(task, status, self._config)
+            execution = self._state._batch_executions.get(
+                getattr(task, 'batch_execution', None))
+            if execution is not None:
+                # Forcing the batch runner done finishes its whole batch,
+                # otherwise its members would stay BATCH_RUNNING forever.
+                self._finish_batch_execution(execution, status, task.expl, task_id)
+            else:
+                self._state.set_status(task, status, self._config)
         return {"task_id": task_id, "status": task.status}
 
     @rpc_method()
@@ -845,6 +1084,18 @@ class Scheduler:
         else:
             _default_task = None
 
+        existing_task = self._state.get_task(task_id)
+        if (existing_task is None
+                and status in (DONE, FAILED)
+                and self._is_stale_batch_token(task_token)):
+            # A result for a batch execution that is not live any more (a
+            # duplicate or a late message of an older round) for a task id
+            # that does not exist either. Do not resurrect a placeholder task
+            # for it. Registrations still create the runner task: the worker
+            # then reports the result for it, which is ignored if stale.
+            logger.info("Ignoring stale batch result for unknown task %s", task_id)
+            return
+
         task = self._state.get_task(task_id, setdefault=_default_task)
 
         if task is None:
@@ -854,6 +1105,14 @@ class Scheduler:
             # A worker reporting that a cancelled execution has stopped.
             # This is the only accepted source of CANCELLED statuses.
             self._confirm_task_cancel(task, worker_id, task_token)
+            return
+
+        if (status in (DONE, FAILED) and self._handle_batch_result(
+                task, task_id, status, task_token, batch_id, expl, worker_id)):
+            # The report belongs to a batch execution (it carried either the
+            # execution token or the batch id) and was either applied to the
+            # whole batch or rejected as stale. Either way there is nothing
+            # left to do for a single task.
             return
 
         if task.status != RUNNING and not worker.enabled:
@@ -873,6 +1132,21 @@ class Scheduler:
                     priority, runnable, status, retry_policy)
             return
 
+        if status == RUNNING and (
+                batch_id is not None
+                or (task_token is not None
+                    and (str(task_token).startswith(BATCH_EXECUTION_TOKEN_PREFIX)
+                         or task_token in self._state._batch_executions))):
+            # A worker registers the task that will execute a dispatched
+            # batch. Only the worker the batch was dispatched to, presenting
+            # the token of a live execution, may register; a late
+            # registration of an earlier execution can not take over a newer
+            # one.
+            self._register_batch_runner(
+                task, worker_id, task_id, batch_id, task_token,
+                family, module, params, tracking_url, batchable,
+                priority, worker)
+            return
         if (task_token is not None and status in (DONE, FAILED) and task.status == RUNNING
                 and getattr(task, 'running_token', None) is not None
                 and task_token != task.running_token):
@@ -880,6 +1154,27 @@ class Scheduler:
             # that was in flight when a newer execution was dispatched).
             logger.info("Ignoring stale %s report for previous execution of %s", status, task_id)
             return
+
+        if batch_id is not None:
+            # A worker (or an older client) associated a task with a batch.
+            # This is only bookkeeping; the batch is finished by the result
+            # handling above.
+            task.batch_id = batch_id
+
+        if status == PENDING and task_token is not None:
+            # The batch runner yielded new requirements: the execution stops
+            # as a batch and all members go back to the pool, to be dispatched
+            # again once the new dependencies exist. Without this the members
+            # would stay BATCH_RUNNING forever.
+            execution = self._state._batch_executions.get(task_token)
+            if (execution is not None
+                    and execution.token == getattr(task, 'batch_execution', None)):
+                for member in list(self._state.get_batch_members(execution)):
+                    self._state.mark_batch_finished(member)
+                    self._state.set_status(member, PENDING, self._config)
+                self._state._batch_executions.pop(execution.token, None)
+                logger.info("Batch execution %s rescheduled with new requirements",
+                            execution.token)
 
         # Ignore claims that the task is PENDING if it very recently was marked as DONE.
         if status == PENDING and task.status == DONE and (time.time() - task.updated) < self._config.stable_done_cooldown_secs:
@@ -895,14 +1190,8 @@ class Scheduler:
         if not task.params:
             task.set_params(params)
 
-        if batch_id is not None:
-            task.batch_id = batch_id
         if status == RUNNING and not task.worker_running:
             task.worker_running = worker_id
-            if batch_id:
-                # copy resources_running of the first batch task
-                batch_tasks = self._state.get_batch_running_tasks(batch_id)
-                task.resources_running = batch_tasks[0].resources_running.copy()
             task.time_running = time.time()
 
         if accepts_messages is not None:
@@ -910,9 +1199,8 @@ class Scheduler:
 
         if tracking_url is not None or task.status != RUNNING:
             task.tracking_url = tracking_url
-            if task.batch_id is not None:
-                for batch_task in self._state.get_batch_running_tasks(task.batch_id):
-                    batch_task.tracking_url = tracking_url
+            if tracking_url is not None:
+                self._propagate_to_batch(task, 'tracking_url', tracking_url)
 
         if batchable is not None:
             task.batchable = batchable
@@ -922,9 +1210,6 @@ class Scheduler:
 
         if expl is not None:
             task.expl = expl
-            if task.batch_id is not None:
-                for batch_task in self._state.get_batch_running_tasks(task.batch_id):
-                    batch_task.expl = expl
 
         task_is_not_running = task.status not in (RUNNING, BATCH_RUNNING)
         task_started_a_run = status in (DONE, FAILED, RUNNING)
@@ -1113,6 +1398,305 @@ class Scheduler:
                     task_id, worker_id)
         return {'task_id': task_id, 'accepted': True, 'status': task.status}
 
+    def _register_batch_runner(self, task, worker_id, task_id, batch_id, task_token,
+                               family, module, params, tracking_url,
+                               batchable, priority, worker):
+        """
+        Handle the worker registering the task that executes a dispatched batch.
+
+        The registration is only accepted from the worker the batch was
+        dispatched to and only when it presents the token of a live execution.
+        A late registration belonging to an older execution (the member
+        combination was re-dispatched in the meantime) is ignored; it can not
+        take over the new execution.
+        """
+        execution, verdict = self._find_batch_execution_for_message(
+            task, task_token, batch_id)
+        if execution is None:
+            if verdict == 'stale' or verdict == 'none':
+                logger.info("Ignoring registration of batch runner %s "
+                            "without a live batch execution", task_id)
+                return
+            # No tracked execution but the batch's members are still waiting:
+            # a report from an older client that only knows batch_id. Fall
+            # back to the legacy association so such clients keep working.
+            self._register_legacy_batch_runner(
+                task, worker_id, task_id, batch_id, family, module, params,
+                tracking_url, batchable, priority, worker)
+            return
+
+        if execution.worker_id != worker_id:
+            logger.warning("Ignoring batch runner registration of %s from worker %s; "
+                           "the execution belongs to worker %s",
+                           task_id, worker_id, execution.worker_id)
+            return
+        if execution.runner_task_id is not None and execution.runner_task_id != task_id:
+            logger.info("Ignoring second batch runner %s for execution %s (runner is %s)",
+                        task_id, execution.token, execution.runner_task_id)
+            return
+
+        self._state.bind_batch_runner(execution, task_id)
+
+        # The runner may have the id of a member (when batch_method combines
+        # the parameters to the value of one of them). In that case the member
+        # object *is* the runner and is promoted from BATCH_RUNNING to RUNNING;
+        # the other members keep waiting for the result. A runner with an
+        # independent id is a fresh task and starts RUNNING.
+        if task.batch_execution == execution.token:
+            self._state.set_status(task, RUNNING, self._config)
+        task.batch_id = execution.batch_id
+        task.batch_execution = execution.token
+        task.batch_runner = task_id
+        task.worker_running = worker_id
+        task.resources_running = self._state.batch_resources(execution)
+        task.time_running = time.time()
+        task.running_token = execution.token
+        if task.family == '' and family:
+            task.family = family
+        if module:
+            task.module = module
+        if params and not task.params:
+            task.set_params(params)
+        if tracking_url is not None:
+            task.tracking_url = tracking_url
+        if batchable is not None:
+            task.batchable = batchable
+        if task.remove is not None:
+            task.remove = None
+        if task.status != RUNNING:
+            self._state.set_status(task, RUNNING, self._config)
+        self._update_task_stakeholders(task, worker, worker_id, False, priority)
+        self._state.get_worker(worker_id).tasks.add(task)
+        self._update_task_history(task, RUNNING)
+
+    def _register_legacy_batch_runner(self, task, worker_id, task_id, batch_id,
+                                      family, module, params, tracking_url,
+                                      batchable, priority, worker):
+        """Registration path for reports that only carry ``batch_id``."""
+        members = self._state.get_batch_running_tasks(batch_id)
+        if (not members and task.status != BATCH_RUNNING
+                and task.worker_running is None):
+            # Nothing is known about this batch any more (e.g. it already
+            # finished); a late registration must not start it again.
+            logger.info("Ignoring registration of unknown batch %s", batch_id)
+            return
+        task.batch_id = batch_id
+        if task.worker_running is None:
+            task.worker_running = worker_id
+        if members:
+            task.resources_running = members[0].resources_running.copy()
+        if task.status == BATCH_RUNNING:
+            self._state.set_status(task, RUNNING, self._config)
+        task.time_running = task.time_running or time.time()
+        for member in members:
+            member.batch_runner = task_id
+            if tracking_url is not None:
+                member.tracking_url = tracking_url
+        if task.family == '' and family:
+            task.family = family
+        if module:
+            task.module = module
+        if params and not task.params:
+            task.set_params(params)
+        if tracking_url is not None:
+            task.tracking_url = tracking_url
+        if task.remove is not None:
+            task.remove = None
+        self._update_task_stakeholders(task, worker, worker_id, False, priority)
+        self._state.get_worker(worker_id).tasks.add(task)
+
+    def _is_stale_batch_token(self, task_token):
+        """
+        Whether a token names a batch execution that is not live any more.
+
+        Batch tokens are self-identifying (prefix), so this needs no record of
+        finished executions.
+        """
+        return (task_token is not None
+                and str(task_token).startswith(BATCH_EXECUTION_TOKEN_PREFIX)
+                and task_token not in self._state._batch_executions)
+
+    def _find_batch_execution_for_message(self, task, task_token, batch_id,
+                                          allow_legacy=True):
+        """
+        Resolve the batch execution a registration/result message belongs to.
+
+        Returns ``(execution, verdict)`` where ``verdict`` is one of:
+
+        ``live``
+            The message belongs to a live execution; it may be applied if the
+            task is a member of that execution.
+        ``stale``
+            The message belongs to a finished or unknown execution. It must be
+            ignored: it is a duplicate, or it comes from a previous round of
+            the same member combination.
+        ``legacy``
+            A token-less report for a batch id that still has BATCH_RUNNING
+            tasks but no tracked execution (state written by an older
+            version). It is handled by the legacy batch association.
+        ``none``
+            This is not a batch message at all.
+        """
+        if (task_token is not None
+                and str(task_token).startswith(BATCH_EXECUTION_TOKEN_PREFIX)):
+            execution = self._state._batch_executions.get(task_token)
+            if execution is not None:
+                return execution, 'live'
+            # A batch token that is not live any more (or never was): it can
+            # only be a duplicate or a leftover of an older execution, so it
+            # must not touch whatever is running now.
+            return None, 'stale'
+
+        # Older clients present only the batch id.
+        if not allow_legacy:
+            return None, 'none'
+        current = getattr(task, 'batch_execution', None)
+        if current is not None:
+            execution = self._state._batch_executions.get(current)
+            if execution is not None:
+                return execution, 'live'
+        bid = batch_id if batch_id is not None else getattr(task, 'batch_id', None)
+        execution = self._state.find_batch_execution_by_batch_id(bid)
+        if execution is not None:
+            return execution, 'live'
+        if bid is None:
+            # Not a batch message. An ordinary report of a task that once
+            # took part in a batch is handled by the normal single-task path
+            # (its current execution token is matched there).
+            return None, 'none'
+        if self._state.get_batch_running_tasks(bid):
+            # Members of this batch are still waiting but the execution is not
+            # tracked (state written by an older version): use the legacy
+            # association.
+            return None, 'legacy'
+        # Nothing of this batch is waiting any more: handle the report as an
+        # ordinary single-task report (it is either its normal completion or
+        # a harmless duplicate).
+        return None, 'none'
+
+    def _handle_batch_result(self, task, task_id, status, task_token, batch_id,
+                             expl, worker_id=None):
+        """
+        Apply a DONE/FAILED report that may belong to a batch execution.
+
+        Returns True when the report was a batch report (applied or rejected),
+        False when it is an ordinary single-task report.
+        """
+        execution, verdict = self._find_batch_execution_for_message(
+            task, task_token, batch_id)
+        if execution is None:
+            if verdict == 'stale':
+                logger.info("Ignoring stale %s report for batch task %s",
+                            status, task_id)
+                return True
+            if verdict == 'legacy':
+                # Batch started by a version without execution tokens: the
+                # members are still BATCH_RUNNING, so finish them as a group.
+                return self._finish_legacy_batch(task, status, expl)
+            return False
+
+        if task_token is None and execution.token != getattr(
+                task, 'batch_execution', None):
+            # A legacy report (batch id only) for a task that belongs to a
+            # different execution: the task was re-dispatched since. It must
+            # not end the current execution or reschedule its members.
+            logger.info("Ignoring %s report of batch execution %s for task %s "
+                        "which belongs to another execution",
+                        status, execution.token, task_id)
+            return True
+
+        if worker_id is not None and execution.worker_id != worker_id:
+            logger.info("Ignoring %s report for batch execution %s from worker %s "
+                        "(the execution belongs to %s)",
+                        status, execution.token, worker_id, execution.worker_id)
+            return True
+
+        self._finish_batch_execution(execution, status, expl, task_id)
+        return True
+
+    def _finish_legacy_batch(self, task, status, expl):
+        """Finish a batch whose execution was not tracked (older state)."""
+        batch_id = getattr(task, 'batch_id', None)
+        members = self._state.get_batch_running_tasks(batch_id)
+        if task not in members:
+            members.append(task)
+        for member in members:
+            if expl is not None:
+                member.expl = expl
+            remove_on_failure = member.batch_id is not None and not member.batchable
+            self._state.clear_batch_association(member)
+            self._state.set_status(member, status, self._config,
+                                   remove_on_failure=remove_on_failure)
+            # A finish without an execution token is a regular task being
+            # recorded as a member of the batch, so clear it from the running
+            # bookkeeping too.
+            member.worker_running = None
+            member.time_running = None
+        return True
+
+    def _finish_batch_execution(self, execution, status, expl, reporter_id=None):
+        """
+        Finish a batch execution as a whole.
+
+        Every member of the execution is moved to ``status`` exactly once.
+        Already-finished members keep their state (which also makes duplicate
+        results harmless), the error explanation is propagated to the
+        members and the batch resources are released by the status change.
+        """
+        logger.info("Batch execution %s (%d tasks) finished with %s",
+                    execution.token, len(execution.task_ids), status)
+        members = list(self._state.get_batch_members(execution))
+        if not members:
+            # Everything already finished: this is a duplicate result.
+            self._state._batch_executions.pop(execution.token, None)
+            return
+
+        if expl is None and reporter_id is not None:
+            reporter = self._state.get_task(reporter_id)
+            if reporter is not None:
+                expl = reporter.expl
+
+        for member in members:
+            if expl is not None:
+                member.expl = expl
+            # Decide on the retry/removal semantics before the association is
+            # cleared: a non-batchable task that took part in a batch keeps
+            # the old behaviour of being dropped on failure instead of
+            # retried.
+            remove_on_failure = member.batch_id is not None and not member.batchable
+            self._state.mark_batch_finished(member)
+            self._state.set_status(member, status, self._config,
+                                   remove_on_failure=remove_on_failure)
+
+        self._state._batch_executions.pop(execution.token, None)
+        self._state.gc_batch_executions()
+        if status == FAILED and self._config.batch_emails:
+            self._batch_failure_email(execution, members)
+
+    def _batch_failure_email(self, execution, members):
+        handled = set()
+        for member in members:
+            batched_params, _ = self._state.get_batcher(execution.worker_id, member.family)
+            if batched_params:
+                unbatched_params = {
+                    param: value
+                    for param, value in member.params.items()
+                    if param not in batched_params
+                }
+            else:
+                unbatched_params = member.params
+            try:
+                expl_raw = json.loads(member.expl)
+            except (TypeError, ValueError):
+                expl_raw = member.expl
+            key = (member.family, tuple(sorted(unbatched_params.items())))
+            if key in handled:
+                continue
+            handled.add(key)
+            self._email_batcher.add_failure(
+                member.pretty_id, member.family, unbatched_params, expl_raw,
+                member._owner_list())
+
     def _confirm_task_cancel(self, task, worker_id, task_token):
         """
         Handle a worker report that a cancelled execution has stopped.
@@ -1263,8 +1847,28 @@ class Scheduler:
         if self._resources is not None:
             # CANCEL_REQUESTED tasks are still executing (or at least not
             # confirmed stopped), so their resources stay reserved until the
-            # cancellation is confirmed.
-            for task in self._state.get_active_tasks_by_status(RUNNING, CANCEL_REQUESTED):
+            # cancellation is confirmed. BATCH_RUNNING members hold the
+            # resources of their batch from the moment the batch is
+            # dispatched, even before the runner registers, so that two
+            # batches sharing a resource can never be dispatched at once.
+            # All tasks of one execution share a single claim: the batch runs
+            # once, so its resources are accounted for once, no matter how
+            # many members and whether the runner is a member itself or a
+            # separate task.
+            counted = set()
+            for task in self._state.get_active_tasks_by_status(
+                    RUNNING, BATCH_RUNNING, CANCEL_REQUESTED):
+                token = getattr(task, 'batch_execution', None)
+                if token is not None:
+                    key = ('execution', token)
+                elif task.batch_id is not None:
+                    # Batch started by a version without execution tokens.
+                    key = ('batch', task.batch_id)
+                else:
+                    key = ('task', task.id)
+                if key in counted:
+                    continue
+                counted.add(key)
                 resources_running = getattr(task, "resources_running", task.resources)
                 if resources_running:
                     for resource, amount in resources_running.items():
@@ -1290,17 +1894,32 @@ class Scheduler:
         return True
 
     def _reset_orphaned_batch_running_tasks(self, worker_id):
-        running_batch_ids = {
-            task.batch_id
-            for task in self._state.get_active_tasks_by_status(RUNNING)
-            if task.worker_running == worker_id
-        }
+        # A batch is claimed by the worker when its runner (or the execution
+        # itself, before the runner registers) is present in the worker's
+        # ``current_tasks``. Only executions are compared, not bare
+        # ``batch_id`` values: the same member combination dispatched again
+        # shares its batch_id but is a different execution.
+        claimed = set()
+        for task in self._state.get_active_tasks_by_status(RUNNING):
+            if task.worker_running == worker_id:
+                token = getattr(task, 'batch_execution', None)
+                if token is not None:
+                    claimed.add(token)
+                elif task.batch_id is not None:
+                    claimed.add(task.batch_id)
         orphaned_tasks = [
             task for task in self._state.get_active_tasks_by_status(BATCH_RUNNING)
-            if task.worker_running == worker_id and task.batch_id not in running_batch_ids
+            if task.worker_running == worker_id and (
+                (getattr(task, 'batch_execution', None) is not None
+                 and task.batch_execution not in claimed)
+                or (getattr(task, 'batch_execution', None) is None
+                    and task.batch_id not in claimed))
         ]
         for task in orphaned_tasks:
+            self._state.mark_batch_finished(task)
             self._state.set_status(task, PENDING)
+        if orphaned_tasks:
+            self._state.gc_batch_executions()
 
     @rpc_method()
     def count_pending(self, worker):
@@ -1461,8 +2080,17 @@ class Scheduler:
         if len(batched_tasks) > 1:
             batch_string = '|'.join(task.id for task in batched_tasks)
             batch_id = hashlib.new('md5', batch_string.encode('utf-8'), usedforsecurity=False).hexdigest()
+            execution = BatchExecution(
+                token=BATCH_EXECUTION_TOKEN_PREFIX + uuid.uuid4().hex,
+                batch_id=batch_id,
+                task_ids=[task.id for task in batched_tasks],
+                worker_id=worker_id,
+                created=time.time(),
+            )
+            self._state.register_batch_execution(execution)
             for task in batched_tasks:
-                self._state.set_batch_running(task, batch_id, worker_id)
+                self._state.set_batch_running(task, batch_id, worker_id,
+                                              execution.token)
 
             combined_params = best_task.params.copy()
             combined_params.update(batched_params)
@@ -1471,11 +2099,32 @@ class Scheduler:
             reply['task_family'] = best_task.family
             reply['task_module'] = getattr(best_task, 'module', None)
             reply['task_params'] = combined_params
-            reply['task_token'] = best_task.running_token
+            # One token identifies the execution for every member and for the
+            # runner, whatever task id the worker ends up using for it.
+            reply['task_token'] = execution.token
             reply['batch_id'] = batch_id
             reply['batch_task_ids'] = [task.id for task in batched_tasks]
 
         elif best_task:
+            execution = self._state._batch_executions.get(
+                getattr(best_task, 'batch_execution', None))
+            if execution is not None:
+                # The batch runner has to run again without a new batch being
+                # formed (e.g. the worker lost track of it). Re-issue the
+                # dispatch under a fresh execution token; members and runner
+                # stay associated, and the previous run's result is stale.
+                execution = self._state.redispatch_batch_execution(execution)
+                best_task.worker_running = worker_id
+                best_task.time_running = time.time()
+                reply['task_id'] = best_task.id
+                reply['task_family'] = best_task.family
+                reply['task_module'] = getattr(best_task, 'module', None)
+                reply['task_params'] = best_task.params
+                reply['task_token'] = execution.token
+                reply['batch_id'] = execution.batch_id
+                reply['batch_task_ids'] = list(execution.task_ids)
+                return reply
+
             self.update_metrics_task_started(best_task)
             self._state.set_status(best_task, RUNNING, self._config)
             best_task.worker_running = worker_id
@@ -1557,6 +2206,11 @@ class Scheduler:
             'status_message': getattr(task, "status_message", None),
             'progress_percentage': getattr(task, "progress_percentage", None),
         }
+        if getattr(task, 'batch_execution', None) is not None:
+            # Lets clients (and the visualiser) relate members of one batch
+            # and the runner even when the runner has an independent id.
+            ret['batch_id'] = task.batch_id
+            ret['batch_runner'] = getattr(task, 'batch_runner', None)
         if task.status == DISABLED:
             ret['re_enable_able'] = task.scheduler_disable_time is not None
         if include_deps:
@@ -1764,7 +2418,7 @@ class Scheduler:
         ''' get total resources and available ones '''
         used_resources = self._used_resources()
         ret = collections.defaultdict(dict)
-        for resource, total in self._resources.items():
+        for resource, total in (self._resources or {}).items():
             ret[resource]['total'] = total
             if resource in used_resources:
                 ret[resource]['used'] = used_resources[resource]
@@ -1823,9 +2477,28 @@ class Scheduler:
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
             task.status_message = status_message
-            if task.status == RUNNING and task.batch_id is not None:
-                for batch_task in self._state.get_batch_running_tasks(task.batch_id):
-                    batch_task.status_message = status_message
+            self._propagate_to_batch(task, 'status_message', status_message)
+
+    def _batch_siblings(self, task):
+        """
+        The other tasks sharing the task's *current* batch execution.
+
+        Using the execution token (rather than the batch id) means progress
+        and resource reports of one execution can not leak into another
+        execution of the same member combination.
+        """
+        token = getattr(task, 'batch_execution', None)
+        if token is None:
+            return []
+        execution = self._state._batch_executions.get(token)
+        if execution is None:
+            return []
+        return [member for member in self._state.get_batch_members(execution)
+                if member is not task]
+
+    def _propagate_to_batch(self, task, attribute, value):
+        for member in self._batch_siblings(task):
+            setattr(member, attribute, value)
 
     @rpc_method()
     def get_task_status_message(self, task_id):
@@ -1840,9 +2513,7 @@ class Scheduler:
         if self._state.has_task(task_id):
             task = self._state.get_task(task_id)
             task.progress_percentage = progress_percentage
-            if task.status == RUNNING and task.batch_id is not None:
-                for batch_task in self._state.get_batch_running_tasks(task.batch_id):
-                    batch_task.progress_percentage = progress_percentage
+            self._propagate_to_batch(task, 'progress_percentage', progress_percentage)
 
     @rpc_method()
     def get_task_progress_percentage(self, task_id):
@@ -1865,9 +2536,9 @@ class Scheduler:
                         resources[resource] = max(0, resources[resource] - decrease_amount)
 
             decrease(task.resources_running, decrease_resources)
-            if task.batch_id is not None:
-                for batch_task in self._state.get_batch_running_tasks(task.batch_id):
-                    decrease(batch_task.resources_running, decrease_resources)
+            for member in self._batch_siblings(task):
+                if getattr(member, 'resources_running', None):
+                    decrease(member.resources_running, decrease_resources)
 
     @rpc_method()
     def get_running_task_resources(self, task_id):

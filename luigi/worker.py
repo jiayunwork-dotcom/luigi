@@ -590,6 +590,9 @@ class Worker:
         self.host = socket.gethostname()
         self._scheduled_tasks = {}
         self._suspended_tasks = {}
+        # Batch member tasks by the id of the task that runs them. The batch
+        # runner may be an independent task id (e.g. ','.join) or the id of
+        # one of the members itself; both are handled the same way.
         self._batch_running_tasks = {}
         self._batch_families_sent = set()
 
@@ -647,9 +650,13 @@ class Worker:
             self._add_task_history.append((task, status, runnable))
             kwargs['owners'] = task._owner_list()
 
-        if task_id in self._batch_running_tasks:
-            for batch_task in self._batch_running_tasks.pop(task_id):
-                self._add_task_history.append((batch_task, status, True))
+        batch_tasks = self._batch_running_tasks.pop(task_id, None)
+        if batch_tasks is not None:
+            # The runner's own history entry is recorded above; its members
+            # share its outcome (a batch finishes as a whole).
+            for batch_task in batch_tasks:
+                if batch_task.task_id != task_id:
+                    self._add_task_history.append((batch_task, status, True))
 
         if task and kwargs.get('params'):
             kwargs['param_visibilities'] = task._get_param_visibilities()
@@ -784,11 +791,17 @@ class Worker:
             formatted_headline, task, command, formatted_traceback)
         notifications.send_error_email(formatted_subject, message, task.owner_email)
 
-    def _handle_task_load_error(self, exception, task_ids):
+    def _handle_task_load_error(self, exception, task_ids, batch_id=None,
+                                task_token=None):
         msg = 'Cannot find task(s) sent by scheduler: {}'.format(','.join(task_ids))
         logger.exception(msg)
         subject = 'Luigi: {}'.format(msg)
         error_message = notifications.wrap_traceback(exception)
+        extra = {}
+        if batch_id is not None:
+            extra['batch_id'] = batch_id
+        if task_token is not None:
+            extra['task_token'] = task_token
         for task_id in task_ids:
             self._add_task(
                 worker=self._id,
@@ -796,6 +809,7 @@ class Worker:
                 status=FAILED,
                 runnable=False,
                 expl=error_message,
+                **extra
             )
         notifications.send_error_email(subject, error_message)
 
@@ -1002,7 +1016,10 @@ class Worker:
                     params_str=get_work_response['task_params'],
                 )
             except Exception as ex:
-                self._handle_task_load_error(ex, get_work_response['batch_task_ids'])
+                self._handle_task_load_error(
+                    ex, get_work_response['batch_task_ids'],
+                    batch_id=get_work_response.get('batch_id'),
+                    task_token=get_work_response.get('task_token'))
                 self.run_succeeded = False
                 return None
 
@@ -1014,6 +1031,10 @@ class Worker:
                 params=task.to_str_params(),
                 status=RUNNING,
                 batch_id=get_work_response['batch_id'],
+                # Prove that this registration belongs to the dispatch the
+                # worker is answering; a registration presented with the
+                # token of an earlier execution is rejected by the scheduler.
+                task_token=get_work_response.get('task_token'),
             )
             return task.task_id
         else:
@@ -1063,8 +1084,9 @@ class Worker:
                 self.run_succeeded = False
 
         if task_id is not None and 'batch_task_ids' in r:
-            batch_tasks = filter(None, [
-                self._scheduled_tasks.get(batch_id) for batch_id in r['batch_task_ids']])
+            batch_tasks = [task for task in (
+                self._scheduled_tasks.get(batch_id) for batch_id in r['batch_task_ids'])
+                if task is not None]
             self._batch_running_tasks[task_id] = batch_tasks
 
         if task_id is not None:
